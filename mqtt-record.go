@@ -6,6 +6,8 @@
 //   $ cd ~/work/
 //   $ git clone https://github.com/yoggy/mqtt-record-replay.git
 //   $ cd mqtt-record-replay
+//   $ go get -u github.com/eclipse/paho.mqtt.golang
+//   $ go get -u github.com/vmihailenco/msgpack
 //   $ go build mqtt-record.go
 //   $ go build mqtt-replay.go
 //
