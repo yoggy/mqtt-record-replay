@@ -1,0 +1,10 @@
+*.swp
+*~
+Thumbs.db
+.DS_Store
+*.dat
+*.mqtt
+*.log
+*.exe
+mqtt-record
+mqtt-replay
