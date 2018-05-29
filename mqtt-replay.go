@@ -24,7 +24,7 @@
 //
 //    example:
 //
-//        $ mqtt-replay.exe recording.mqtt tcp://iot.exlipse.org:1883
+//        $ mqtt-replay.exe recording.mqtt tcp://iot.eclipse.org:1883
 //
 // License:
 //   Copyright (c) 2018 yoggy <yoggy0@gmail.com>

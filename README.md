@@ -22,7 +22,7 @@ How to
  
     example:
  
-        $ mqtt-record.exe tcp://iot.exlipse.org:1883 "test/record/topic/#" record.mqtt
+        $ mqtt-record.exe tcp://iot.eclipse.org:1883 "test/record/topic/#" record.mqtt
  
  
     $ ./mqtt-replay
@@ -30,7 +30,7 @@ How to
  
      example:
  
-         $ mqtt-replay.exe recording.mqtt tcp://iot.exlipse.org:1883
+         $ mqtt-replay.exe recording.mqtt tcp://iot.eclipse.org:1883
 
 Copyright and license
 ----
