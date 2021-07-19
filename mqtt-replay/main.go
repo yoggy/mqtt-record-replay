@@ -126,6 +126,7 @@ func mqtt_replay(filename, url string) {
 				if (millis() - t0) >= (msg.Millis - t1) {
 					break
 				}
+				time.Sleep(200 * time.Microsecond)
 			}
 		}
 		fmt.Printf("mqtt_replay() : t=%d topic=%s, payload_size=%d\n", msg.Millis, msg.Topic, payload_size)
