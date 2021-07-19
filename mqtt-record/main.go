@@ -36,13 +36,14 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
-	mqtt "github.com/eclipse/paho.mqtt.golang"
-	msgpack "github.com/vmihailenco/msgpack"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+	msgpack "github.com/vmihailenco/msgpack"
 )
 
 var file *os.File
