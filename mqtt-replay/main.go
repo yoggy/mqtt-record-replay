@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"os"
 	"time"
+	"strconv"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	msgpack "github.com/vmihailenco/msgpack"
@@ -82,7 +83,7 @@ func readPayload(f *os.File, size int64) []byte {
 	return buf
 }
 
-func mqtt_replay(filename, url string) {
+func mqtt_replay(filename, url string, start int64, stop int64) {
 	f, err := os.Open(filename)
 	if err != nil {
 		panic(err)
@@ -100,8 +101,10 @@ func mqtt_replay(filename, url string) {
 
 	fmt.Printf("mqtt_replay() : start replay...file=%s, url=%s\n", filename, url)
 
+	firstMsg := true
+	startTime := millis()
 	t0 := int64(0)
-	t1 := int64(0)
+	t1 := start
 
 	for {
 		payload_size := readPayloadSize(f)
@@ -120,30 +123,59 @@ func mqtt_replay(filename, url string) {
 			panic(err)
 		}
 
-		if t0 > 0 {
-			// spin lock
-			for {
-				if (millis() - t0) >= (msg.Millis - t1) {
-					break
-				}
-				time.Sleep(200 * time.Microsecond)
-			}
+		if firstMsg{
+			firstMsg = false;
+			stop = stop - start
+			start += msg.Millis
 		}
-		fmt.Printf("mqtt_replay() : t=%d topic=%s, payload_size=%d\n", msg.Millis, msg.Topic, payload_size)
-		t0 = millis()
-		t1 = msg.Millis
+		
+		if (msg.Millis >= start){
 
-		token := client.Publish(msg.Topic, byte(0), false, msg.Payload)
-		token.Wait()
+			if ((stop > 0) && ((millis() - startTime) > (stop))){
+				break
+			}
+			
+			if t0 > 0 {
+				// spin lock
+				for {
+					if (millis() - t0) >= (msg.Millis - t1) {
+						break
+					}
+					time.Sleep(200 * time.Microsecond)
+				}
+			}
+			fmt.Printf("mqtt_replay() : t=%d topic=%s, payload_size=%d\n", msg.Millis, msg.Topic, payload_size)
+			t0 = millis()
+			t1 = msg.Millis
+	
+			token := client.Publish(msg.Topic, byte(0), false, msg.Payload)
+			token.Wait()
+		}
 	}
 
 	fmt.Println("mqtt_record() : finish...")
 }
 
 func main() {
-	if len(os.Args) != 3 {
-		usage()
+	//if len(os.Args) != 3 {
+	//	usage()
+	//}
+	start := int64(0)
+	stop := int64(-1) 
+	if len(os.Args) >= 4 {
+		tmp, err := strconv.ParseInt(os.Args[3], 0, 64)
+		if(err != nil) {
+			panic(err)
+		}
+		start = tmp * 1000
 	}
-
-	mqtt_replay(os.Args[1], os.Args[2])
+	if len(os.Args) >= 5 {
+		tmp, err := strconv.ParseInt(os.Args[4], 0, 64)
+		if(err != nil) {
+			panic(err)
+		}
+		stop = tmp * 1000
+	} 
+	fmt.Printf("%d - %d\n", start, stop)
+	mqtt_replay(os.Args[1], os.Args[2], start, stop)
 }
