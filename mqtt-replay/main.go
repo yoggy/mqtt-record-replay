@@ -37,16 +37,17 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"time"
 	"strconv"
+	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	msgpack "github.com/vmihailenco/msgpack"
 )
 
-func usage() {
-	fmt.Printf("usage: %s recording_filename url \n", os.Args[0])
-	fmt.Printf("\n")
+func usage(msg string) {
+	fmt.Printf("%s\n", msg)
+	fmt.Printf("usage: %s recording_filename url [start_time] [stop_time]\n", os.Args[0])
+	fmt.Printf("start & stop time in seconds\n")
 	fmt.Printf("example:\n")
 	fmt.Printf("\n")
 	fmt.Printf("    $ %s recording.mqtt tcp://iot.exlipse.org:1883\n", os.Args[0])
@@ -86,6 +87,7 @@ func readPayload(f *os.File, size int64) []byte {
 func mqtt_replay(filename, url string, start int64, stop int64) {
 	f, err := os.Open(filename)
 	if err != nil {
+		usage(string("Couldn't open File"))
 		panic(err)
 	}
 	defer f.Close()
@@ -96,6 +98,7 @@ func mqtt_replay(filename, url string, start int64, stop int64) {
 	client := mqtt.NewClient(opts)
 	defer client.Disconnect(100)
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
+		usage(string("Couldn't connect to Mqtt Broker"))
 		panic(token.Error())
 	}
 
@@ -120,21 +123,26 @@ func mqtt_replay(filename, url string, start int64, stop int64) {
 		var msg MqttMessage
 		err = msgpack.Unmarshal(payload_buf, &msg)
 		if err != nil {
+			usage(string("Couldn't unpack Message"))
 			panic(err)
 		}
 
-		if firstMsg{
-			firstMsg = false;
+		if firstMsg {
+			firstMsg = false
+			hadStop := stop > 0
 			stop = stop - start
+			if hadStop && (stop < 0) {
+				stop = 0
+			}
 			start += msg.Millis
 		}
-		
-		if (msg.Millis >= start){
 
-			if ((stop > 0) && ((millis() - startTime) > (stop))){
+		if msg.Millis >= start {
+
+			if (stop >= 0) && ((millis() - startTime) > (stop)) {
 				break
 			}
-			
+
 			if t0 > 0 {
 				// spin lock
 				for {
@@ -147,7 +155,7 @@ func mqtt_replay(filename, url string, start int64, stop int64) {
 			fmt.Printf("mqtt_replay() : t=%d topic=%s, payload_size=%d\n", msg.Millis, msg.Topic, payload_size)
 			t0 = millis()
 			t1 = msg.Millis
-	
+
 			token := client.Publish(msg.Topic, byte(0), false, msg.Payload)
 			token.Wait()
 		}
@@ -157,25 +165,39 @@ func mqtt_replay(filename, url string, start int64, stop int64) {
 }
 
 func main() {
-	//if len(os.Args) != 3 {
-	//	usage()
-	//}
+	if len(os.Args) < 3 {
+		usage(string("To few Arguments"))
+	}
+	if len(os.Args) > 5 {
+		usage("To many Arguments")
+	}
+
 	start := int64(0)
-	stop := int64(-1) 
+	stop := int64(-1)
+
 	if len(os.Args) >= 4 {
 		tmp, err := strconv.ParseInt(os.Args[3], 0, 64)
-		if(err != nil) {
+		if err != nil {
+			usage(string("Start Time has to be an integer"))
 			panic(err)
 		}
 		start = tmp * 1000
+		if start < 0 {
+			start = 0
+		}
 	}
 	if len(os.Args) >= 5 {
 		tmp, err := strconv.ParseInt(os.Args[4], 0, 64)
-		if(err != nil) {
+		if err != nil {
+			usage(string("Stop Time has to be an integer"))
 			panic(err)
 		}
 		stop = tmp * 1000
-	} 
-	fmt.Printf("%d - %d\n", start, stop)
+	}
+	if stop >= 0 {
+		fmt.Printf("%dms - %dms\n", start, stop)
+	} else {
+		fmt.Printf("%d - End\n", start)
+	}
 	mqtt_replay(os.Args[1], os.Args[2], start, stop)
 }
