@@ -53,79 +53,35 @@ type MqttMessage struct {
 	Payload []byte
 }
 
-func readPayloadSize(f *os.File) int64 {
+func readEntry(file *os.File) (MqttMessage, int64) {
+	// read payload size entry
 	buf := make([]byte, binary.MaxVarintLen64)
-	_, err := f.Read(buf)
+	_, err := file.Read(buf)
 	if err != nil {
-		return -1
+		return MqttMessage{}, -1 // EOF reached
 	}
 	payload_size, _ := binary.Varint(buf)
-	return payload_size
-}
 
-func readPayload(f *os.File, size int64) []byte {
-	buf := make([]byte, size)
-	_, err := f.Read(buf)
+	// read payload buffer
+	payload_buf := make([]byte, payload_size)
+	_, err = file.Read(payload_buf)
 	if err != nil {
-		return nil
+		return MqttMessage{}, -1 // EOF reached
 	}
-	return buf
+
+	// unpack message
+	var msg MqttMessage
+	err = msgpack.Unmarshal(payload_buf, &msg)
+	if err != nil {
+		log.Fatalln("Fatal error unpacking packet in recording file")
+	}
+
+	return msg, payload_size
 }
 
-func mqtt_replay(file *os.File, client mqtt.Client, startTimeMillis int64, stopTimeMillis int64) {
-	startWallclock := nowMillis() // TODO: should not be needed
-
-	firstMsg := true
-	t0 := int64(0)
-	t1 := startTimeMillis
-	hasStopTime := stopTimeMillis > 0
-
-	for {
-		payload_size := readPayloadSize(file)
-		if payload_size == -1 {
-			break
-		}
-
-		payload_buf := readPayload(file, payload_size)
-		if payload_buf == nil {
-			break
-		}
-
-		var msg MqttMessage
-		err := msgpack.Unmarshal(payload_buf, &msg)
-		if err != nil {
-			log.Fatalln("Fatal error unpacking packet in recording file")
-		}
-
-		if firstMsg {
-			firstMsg = false
-			stopTimeMillis = stopTimeMillis - startTimeMillis
-			startTimeMillis += msg.Millis
-		}
-
-		if msg.Millis >= startTimeMillis {
-
-			if (hasStopTime) && ((nowMillis() - startWallclock) > (stopTimeMillis)) {
-				break
-			}
-
-			if t0 > 0 {
-				// spin lock
-				for {
-					if (nowMillis() - t0) >= (msg.Millis - t1) {
-						break
-					}
-					time.Sleep(200 * time.Microsecond)
-				}
-			}
-			log.Printf("t=%6d ms, %6d bytes, topic=%s\n", msg.Millis-startTimeMillis, payload_size, msg.Topic)
-			t0 = nowMillis()
-			t1 = msg.Millis
-
-			token := client.Publish(msg.Topic, byte(0), false, msg.Payload)
-			token.Wait()
-		}
-	}
+func publish(client mqtt.Client, msg MqttMessage) {
+	token := client.Publish(msg.Topic, byte(0), false, msg.Payload)
+	token.Wait()
 }
 
 func main() {
@@ -164,11 +120,59 @@ func main() {
 		log.Println("Success connecting to MQTT broker")
 	}
 
+	//
 	// process recording file
-	var startMillis = int64(startTimeSec) * 1000
-	var stopMillis = int64(endTimeSec) * 1000
+	//
+	endTimeAvailable := endTimeSec > 0
 
-	mqtt_replay(file, client, startMillis, stopMillis)
+	// get first entry in recording file
+	msg, len := readEntry(file)
+	recordingStartTime := msg.Millis // timestamp of first entry in file
+
+	var firstMsgMilis int64
+	var firstMsgWallclock int64
+
+	// fast forward to message at requested start time
+	for {
+		if msg.Millis-recordingStartTime >= int64(startTimeSec*1000) {
+			log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(msg.Millis-recordingStartTime)/1000.0, len, msg.Topic)
+			publish(client, msg)
+
+			firstMsgMilis = msg.Millis
+			firstMsgWallclock = nowMillis()
+
+			break
+		}
+
+		msg, len = readEntry(file) // skip to next message
+	}
+
+	// play messages until requested end time
+	for {
+		msg, len = readEntry(file)
+		if len < 0 {
+			log.Println("End of recording reached")
+			break
+		}
+
+		// check requested end time
+		if endTimeAvailable && msg.Millis-recordingStartTime > int64(endTimeSec*1000) {
+			log.Println("Requested end time reached")
+			break
+		}
+
+		// wait for target time to be reached
+		targetWallclock := firstMsgWallclock + (msg.Millis - firstMsgMilis)
+		for {
+			if nowMillis() >= targetWallclock {
+				log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(msg.Millis-recordingStartTime)/1000.0, len, msg.Topic)
+				publish(client, msg)
+				break
+			}
+
+			time.Sleep(200 * time.Microsecond)
+		}
+	}
 
 	log.Println("Replay finished")
 }
