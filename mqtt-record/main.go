@@ -21,7 +21,7 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
-	msgpack "github.com/vmihailenco/msgpack"
+	msgpack "github.com/vmihailenco/msgpack/v5"
 )
 
 const buildVersion string = "v2.0.0-alpha"
