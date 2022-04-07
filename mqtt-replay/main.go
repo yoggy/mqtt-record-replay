@@ -1,33 +1,11 @@
 //
 // mqtt-replay.go - tools for recording from and playing back to MQTT topics.
 //
-// How to:
-//   $ mkdir -p ~/work/
-//   $ cd ~/work/
-//   $ git clone https://github.com/yoggy/mqtt-record-replay.git
-//   $ cd mqtt-record-replay
-//   $ go get -u github.com/eclipse/paho.mqtt.golang
-//   $ go get -u github.com/vmihailenco/msgpack
-//   $ go build mqtt-record.go
-//   $ go build mqtt-replay.go
-//
-//   $ ./mqtt-record
-//   usage: mqtt-record.exe url subscribe_topic record_filename
-//
-//   example:
-//
-//       $ mqtt-record.exe tcp://iot.exlipse.org:1883 "test/record/topic/#" record.mqtt
-//
-//
-//   $ ./mqtt-replay
-//   usage: mqtt-replay.exe recording_filename url
-//
-//    example:
-//
-//        $ mqtt-replay.exe recording.mqtt tcp://iot.eclipse.org:1883
 //
 // License:
 //   Copyright (c) 2018 yoggy <yoggy0@gmail.com>
+//   Copyright (c) 2021 Bendix Buchheister <buchheister@consider-it.de>
+//   Copyright (c) 2022 Jannik Beyerstedt <beyerstedt@consider-it.de>
 //   Released under the MIT license
 //   http://opensource.org/licenses/mit-license.php;
 //
@@ -35,24 +13,29 @@ package main
 
 import (
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"os"
-	"strconv"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	msgpack "github.com/vmihailenco/msgpack"
 )
 
-func usage(msg string) {
-	fmt.Printf("%s\n", msg)
-	fmt.Printf("usage: %s recording_filename url [start_time] [stop_time]\n", os.Args[0])
-	fmt.Printf("start & stop time in seconds\n")
-	fmt.Printf("example:\n")
-	fmt.Printf("\n")
-	fmt.Printf("    $ %s recording.mqtt tcp://iot.exlipse.org:1883\n", os.Args[0])
-	fmt.Printf("\n")
-	os.Exit(0)
+const buildVersion string = "v2.0.0-alpha"
+
+// configuration values
+var brokerURL string
+var filename string
+var startTimeSec uint
+var endTimeSec uint // end time of 0 seconds doesn't make sense, so use it for "full file"
+
+func init() {
+	flag.StringVar(&brokerURL, "b", "tcp://localhost:1883", "MQTT broker URL")
+	flag.StringVar(&filename, "i", "", "Input file")
+	flag.UintVar(&startTimeSec, "s", 0, "Starting time offset (seconds)")
+	flag.UintVar(&endTimeSec, "e", 0, "End time (seconds, leave out for full file)")
+	flag.Parse()
 }
 
 func millis() int64 {
@@ -84,10 +67,10 @@ func readPayload(f *os.File, size int64) []byte {
 	return buf
 }
 
-func mqtt_replay(filename, url string, start int64, stop int64) {
+func mqtt_replay(filename, url string, startTimeMillis int64, stopTimeMillis int64) {
 	f, err := os.Open(filename)
 	if err != nil {
-		usage(string("Couldn't open File"))
+		fmt.Println("Input file could not be opened!")
 		panic(err)
 	}
 	defer f.Close()
@@ -98,7 +81,7 @@ func mqtt_replay(filename, url string, start int64, stop int64) {
 	client := mqtt.NewClient(opts)
 	defer client.Disconnect(100)
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		usage(string("Couldn't connect to Mqtt Broker"))
+		fmt.Println("Connection to MQTT broker failed!")
 		panic(token.Error())
 	}
 
@@ -107,7 +90,8 @@ func mqtt_replay(filename, url string, start int64, stop int64) {
 	firstMsg := true
 	startTime := millis()
 	t0 := int64(0)
-	t1 := start
+	t1 := startTimeMillis
+	hasStopTime := stopTimeMillis > 0
 
 	for {
 		payload_size := readPayloadSize(f)
@@ -123,23 +107,20 @@ func mqtt_replay(filename, url string, start int64, stop int64) {
 		var msg MqttMessage
 		err = msgpack.Unmarshal(payload_buf, &msg)
 		if err != nil {
-			usage(string("Couldn't unpack Message"))
+			fmt.Println("Fatal error unpacking packet in recording file")
 			panic(err)
 		}
 
 		if firstMsg {
 			firstMsg = false
-			hadStop := stop > 0
-			stop = stop - start
-			if hadStop && (stop < 0) {
-				stop = 0
-			}
-			start += msg.Millis
+			stopTimeMillis = stopTimeMillis - startTimeMillis
+			startTimeMillis += msg.Millis
 		}
 
-		if msg.Millis >= start {
+		if msg.Millis >= startTimeMillis {
 
-			if (stop >= 0) && ((millis() - startTime) > (stop)) {
+			if (hasStopTime) && ((millis() - startTime) > (stopTimeMillis)) {
+				fmt.Println("TODO: stopping file")
 				break
 			}
 
@@ -165,39 +146,18 @@ func mqtt_replay(filename, url string, start int64, stop int64) {
 }
 
 func main() {
-	if len(os.Args) < 3 {
-		usage(string("To few Arguments"))
+	fmt.Println("MQTT Recording Replay " + buildVersion)
+	fmt.Println("- MQTT broker:     ", brokerURL)
+	fmt.Println("- Input filename:  ", filename)
+	if endTimeSec > 0 {
+		fmt.Println("- Interval:        ", startTimeSec, "-", endTimeSec, "sec.")
+	} else if startTimeSec > 0 {
+		fmt.Println("- Start time:      ", startTimeSec, "sec.")
 	}
-	if len(os.Args) > 5 {
-		usage("To many Arguments")
-	}
+	fmt.Println("")
 
-	start := int64(0)
-	stop := int64(-1)
+	var startMillis = int64(startTimeSec) * 1000
+	var stopMillis = int64(endTimeSec) * 1000
 
-	if len(os.Args) >= 4 {
-		tmp, err := strconv.ParseInt(os.Args[3], 0, 64)
-		if err != nil {
-			usage(string("Start Time has to be an integer"))
-			panic(err)
-		}
-		start = tmp * 1000
-		if start < 0 {
-			start = 0
-		}
-	}
-	if len(os.Args) >= 5 {
-		tmp, err := strconv.ParseInt(os.Args[4], 0, 64)
-		if err != nil {
-			usage(string("Stop Time has to be an integer"))
-			panic(err)
-		}
-		stop = tmp * 1000
-	}
-	if stop >= 0 {
-		fmt.Printf("%dms - %dms\n", start, stop)
-	} else {
-		fmt.Printf("%d - End\n", start)
-	}
-	mqtt_replay(os.Args[1], os.Args[2], start, stop)
+	mqtt_replay(filename, brokerURL, startMillis, stopMillis)
 }

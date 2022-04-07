@@ -1,33 +1,10 @@
 //
 // mqtt-record.go - tools for recording from and playing back to MQTT topics.
 //
-// How to:
-//   $ mkdir -p ~/work/
-//   $ cd ~/work/
-//   $ git clone https://github.com/yoggy/mqtt-record-replay.git
-//   $ cd mqtt-record-replay
-//   $ go get -u github.com/eclipse/paho.mqtt.golang
-//   $ go get -u github.com/vmihailenco/msgpack
-//   $ go build mqtt-record.go
-//   $ go build mqtt-replay.go
-//
-//   $ ./mqtt-record
-//   usage: mqtt-record.exe url subscribe_topic record_filename
-//
-//   example:
-//
-//       $ mqtt-record.exe tcp://iot.eclipse.org:1883 "test/record/topic/#" record.mqtt
-//
-//
-//   $ ./mqtt-replay
-//   usage: mqtt-replay.exe recording_filename url
-//
-//    example:
-//
-//        $ mqtt-replay.exe recording.mqtt tcp://iot.exlipse.org:1883
 //
 // License:
 //   Copyright (c) 2018 yoggy <yoggy0@gmail.com>
+//   Copyright (c) 2022 Jannik Beyerstedt <beyerstedt@consider-it.de>
 //   Released under the MIT license
 //   http://opensource.org/licenses/mit-license.php;
 //
@@ -35,6 +12,7 @@ package main
 
 import (
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -46,17 +24,24 @@ import (
 	msgpack "github.com/vmihailenco/msgpack"
 )
 
+const buildVersion string = "v2.0.0-alpha"
+
+// global variables
 var file *os.File
 var wg = &sync.WaitGroup{}
 
-func usage() {
-	fmt.Printf("usage: %s url subscribe_topic recording_filename \n", os.Args[0])
-	fmt.Printf("\n")
-	fmt.Printf("example:\n")
-	fmt.Printf("\n")
-	fmt.Printf("    $ %s tcp://iot.exlipse.org:1883 \"test/record/topic/#\" recording.mqtt\n", os.Args[0])
-	fmt.Printf("\n")
-	os.Exit(0)
+// configuration values
+var brokerURL string
+var topic string
+var filename string
+
+func init() {
+	autoFileName := "recording-" + time.Now().Format("2006-01-02T150405") + ".mqtt"
+
+	flag.StringVar(&brokerURL, "b", "tcp://localhost:1883", "MQTT broker URL")
+	flag.StringVar(&topic, "t", "#", "MQTT topic to subscribe")
+	flag.StringVar(&filename, "o", autoFileName, "Output file name")
+	flag.Parse()
 }
 
 func millis() int64 {
@@ -120,9 +105,11 @@ func mqtt_record(url, topic, filename string) {
 }
 
 func main() {
-	if len(os.Args) != 4 {
-		usage()
-	}
+	fmt.Println("MQTT Recorder " + buildVersion)
+	fmt.Println("- MQTT broker:     ", brokerURL)
+	fmt.Println("- Subscribe topic: ", topic)
+	fmt.Println("- Output filename: ", filename)
+	fmt.Println("")
 
 	wg.Add(1)
 	c := make(chan os.Signal, 1)
@@ -134,7 +121,7 @@ func main() {
 		}
 	}()
 
-	mqtt_record(os.Args[1], os.Args[2], os.Args[3])
+	mqtt_record(brokerURL, topic, filename)
 
 	os.Exit(0)
 }
