@@ -14,10 +14,9 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"os"
-	"os/signal"
-	"sync"
-	"syscall"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -28,15 +27,20 @@ const buildVersion string = "v2.0.0-alpha"
 
 // global variables
 var file *os.File
-var wg = &sync.WaitGroup{}
+var msgCnt uint
 
 // configuration values
+var verbosity int
 var brokerURL string
 var topic string
 var filename string
 
+const msgStatsTime int = 5 // report statistics every 5 seconds
+
 func init() {
 	autoFileName := "recording-" + time.Now().Format("2006-01-02T150405") + ".mqtt"
+
+	flag.IntVar(&verbosity, "v", 1, "verbosity level: off (0), info (1), debug (2)")
 
 	flag.StringVar(&brokerURL, "b", "tcp://localhost:1883", "MQTT broker URL")
 	flag.StringVar(&topic, "t", "#", "MQTT topic to subscribe")
@@ -44,7 +48,7 @@ func init() {
 	flag.Parse()
 }
 
-func millis() int64 {
+func nowMillis() int64 {
 	return time.Now().UnixNano() / int64(time.Millisecond)
 }
 
@@ -55,53 +59,27 @@ type MqttMessage struct {
 }
 
 var message_handler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Message) {
-	t := millis()
+	t := nowMillis()
 	topic := msg.Topic()
 	payload := msg.Payload()
+	msgCnt++
 
 	buf_payload, err := msgpack.Marshal(&MqttMessage{Millis: t, Topic: topic, Payload: payload})
 	if err != nil {
-		panic(err)
+		log.Fatalln("Error creating packet:", err)
 	}
 
 	size := int64(len(buf_payload))
-	fmt.Printf("t=%d, topic=%s, size=%d\n", t, topic, size)
-	//fmt.Printf("%+v\n", b)
+	if verbosity > 1 {
+		log.Printf("t=%d, %6d bytes, topic=%s\n", t, size, topic)
+	}
 
 	buf_size := make([]byte, binary.MaxVarintLen64)
 	binary.PutVarint(buf_size, size)
-	//s,_ := binary.Varint(buf_size)
 
 	file.Write(buf_size)
 	file.Write(buf_payload)
 	file.Sync()
-}
-
-func mqtt_record(url, topic, filename string) {
-	f, err := os.Create(filename)
-	if err != nil {
-		panic(err)
-	}
-	file = f
-	defer f.Close()
-
-	opts := mqtt.NewClientOptions()
-	opts.AddBroker(url)
-	opts.SetDefaultPublishHandler(message_handler)
-
-	client := mqtt.NewClient(opts)
-	defer client.Disconnect(100)
-	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		panic(token.Error())
-	}
-
-	fmt.Printf("mqtt_record() : subscribe start...topic=%s\n", topic)
-	if token := client.Subscribe(topic, 0, nil); token.Wait() && token.Error() != nil {
-		panic(token.Error())
-	}
-
-	wg.Wait()
-	fmt.Println("mqtt_record() : leave...")
 }
 
 func main() {
@@ -111,17 +89,46 @@ func main() {
 	fmt.Println("- Output filename: ", filename)
 	fmt.Println("")
 
-	wg.Add(1)
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
-	go func() {
-		for sig := range c {
-			fmt.Println("", sig)
-			wg.Done()
+	if verbosity < 1 {
+		log.SetFlags(0)
+		log.SetOutput(ioutil.Discard)
+	}
+
+	// try opening file for writing
+	var err error
+	file, err = os.Create(filename)
+	if err != nil {
+		log.Fatalln("Error opening file for writing:", err)
+	}
+	defer file.Close()
+
+	// subscribe to MQTT and write recording
+	opts := mqtt.NewClientOptions()
+	opts.AddBroker(brokerURL)
+	opts.SetDefaultPublishHandler(message_handler)
+
+	client := mqtt.NewClient(opts)
+	defer client.Disconnect(100)
+	if token := client.Connect(); token.Wait() && token.Error() != nil {
+		log.Fatalln("Error connecting to MQTT broker:", token.Error())
+	}
+	if verbosity > 1 {
+		log.Println("Success connecting to MQTT broker")
+	}
+
+	if token := client.Subscribe(topic, 0, nil); token.Wait() && token.Error() != nil {
+		log.Fatalln("Error subscribing to MQTT topic:", token.Error())
+	}
+	if verbosity > 1 {
+		log.Println("Success subscribing to topic")
+	}
+
+	for {
+		if verbosity == 1 {
+			log.Printf("Recorded %4d messages in last %d sec.", msgCnt, msgStatsTime)
 		}
-	}()
+		msgCnt = 0
 
-	mqtt_record(brokerURL, topic, filename)
-
-	os.Exit(0)
+		time.Sleep(time.Duration(msgStatsTime) * time.Second)
+	}
 }

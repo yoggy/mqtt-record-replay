@@ -15,6 +15,8 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"os"
 	"time"
 
@@ -25,12 +27,15 @@ import (
 const buildVersion string = "v2.0.0-alpha"
 
 // configuration values
+var verbosity int
 var brokerURL string
 var filename string
 var startTimeSec uint
 var endTimeSec uint // end time of 0 seconds doesn't make sense, so use it for "full file"
 
 func init() {
+	flag.IntVar(&verbosity, "v", 1, "verbosity level: off (0), info (1), debug (2)")
+
 	flag.StringVar(&brokerURL, "b", "tcp://localhost:1883", "MQTT broker URL")
 	flag.StringVar(&filename, "i", "", "Input file")
 	flag.UintVar(&startTimeSec, "s", 0, "Starting time offset (seconds)")
@@ -38,7 +43,7 @@ func init() {
 	flag.Parse()
 }
 
-func millis() int64 {
+func nowMillis() int64 {
 	return time.Now().UnixNano() / int64(time.Millisecond)
 }
 
@@ -67,48 +72,29 @@ func readPayload(f *os.File, size int64) []byte {
 	return buf
 }
 
-func mqtt_replay(filename, url string, startTimeMillis int64, stopTimeMillis int64) {
-	f, err := os.Open(filename)
-	if err != nil {
-		fmt.Println("Input file could not be opened!")
-		panic(err)
-	}
-	defer f.Close()
-
-	opts := mqtt.NewClientOptions()
-	opts.AddBroker(url)
-
-	client := mqtt.NewClient(opts)
-	defer client.Disconnect(100)
-	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		fmt.Println("Connection to MQTT broker failed!")
-		panic(token.Error())
-	}
-
-	fmt.Printf("mqtt_replay() : start replay...file=%s, url=%s\n", filename, url)
+func mqtt_replay(file *os.File, client mqtt.Client, startTimeMillis int64, stopTimeMillis int64) {
+	startWallclock := nowMillis() // TODO: should not be needed
 
 	firstMsg := true
-	startTime := millis()
 	t0 := int64(0)
 	t1 := startTimeMillis
 	hasStopTime := stopTimeMillis > 0
 
 	for {
-		payload_size := readPayloadSize(f)
+		payload_size := readPayloadSize(file)
 		if payload_size == -1 {
 			break
 		}
 
-		payload_buf := readPayload(f, payload_size)
+		payload_buf := readPayload(file, payload_size)
 		if payload_buf == nil {
 			break
 		}
 
 		var msg MqttMessage
-		err = msgpack.Unmarshal(payload_buf, &msg)
+		err := msgpack.Unmarshal(payload_buf, &msg)
 		if err != nil {
-			fmt.Println("Fatal error unpacking packet in recording file")
-			panic(err)
+			log.Fatalln("Fatal error unpacking packet in recording file")
 		}
 
 		if firstMsg {
@@ -119,30 +105,27 @@ func mqtt_replay(filename, url string, startTimeMillis int64, stopTimeMillis int
 
 		if msg.Millis >= startTimeMillis {
 
-			if (hasStopTime) && ((millis() - startTime) > (stopTimeMillis)) {
-				fmt.Println("TODO: stopping file")
+			if (hasStopTime) && ((nowMillis() - startWallclock) > (stopTimeMillis)) {
 				break
 			}
 
 			if t0 > 0 {
 				// spin lock
 				for {
-					if (millis() - t0) >= (msg.Millis - t1) {
+					if (nowMillis() - t0) >= (msg.Millis - t1) {
 						break
 					}
 					time.Sleep(200 * time.Microsecond)
 				}
 			}
-			fmt.Printf("mqtt_replay() : t=%d topic=%s, payload_size=%d\n", msg.Millis, msg.Topic, payload_size)
-			t0 = millis()
+			log.Printf("t=%6d ms, %6d bytes, topic=%s\n", msg.Millis-startTimeMillis, payload_size, msg.Topic)
+			t0 = nowMillis()
 			t1 = msg.Millis
 
 			token := client.Publish(msg.Topic, byte(0), false, msg.Payload)
 			token.Wait()
 		}
 	}
-
-	fmt.Println("mqtt_record() : finish...")
 }
 
 func main() {
@@ -156,8 +139,36 @@ func main() {
 	}
 	fmt.Println("")
 
+	if verbosity < 1 {
+		log.SetFlags(0)
+		log.SetOutput(ioutil.Discard)
+	}
+
+	// try opening file for reading
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalln("Error opening file for reading:", err)
+	}
+	defer file.Close()
+
+	// try connecting to MQTT broker
+	opts := mqtt.NewClientOptions()
+	opts.AddBroker(brokerURL)
+
+	client := mqtt.NewClient(opts)
+	defer client.Disconnect(100)
+	if token := client.Connect(); token.Wait() && token.Error() != nil {
+		log.Panicln("Error connecting to MQTT broker:", token.Error())
+	}
+	if verbosity > 1 {
+		log.Println("Success connecting to MQTT broker")
+	}
+
+	// process recording file
 	var startMillis = int64(startTimeSec) * 1000
 	var stopMillis = int64(endTimeSec) * 1000
 
-	mqtt_replay(filename, brokerURL, startMillis, stopMillis)
+	mqtt_replay(file, client, startMillis, stopMillis)
+
+	log.Println("Replay finished")
 }
