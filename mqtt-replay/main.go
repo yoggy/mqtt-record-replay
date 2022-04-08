@@ -13,15 +13,18 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
+	"os/signal"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	msgpack "github.com/vmihailenco/msgpack/v5"
+	"golang.org/x/term"
 )
 
 const buildVersion string = "v2.0.0-alpha"
@@ -33,6 +36,10 @@ var filename string
 var startTimeSec uint
 var endTimeSec uint // end time of 0 seconds doesn't make sense, so use it for "full file"
 
+// internal state
+var shouldHalt bool
+var shouldExit bool
+
 func init() {
 	flag.IntVar(&verbosity, "v", 1, "verbosity level: off (0), info (1), debug (2)")
 
@@ -41,6 +48,9 @@ func init() {
 	flag.UintVar(&startTimeSec, "s", 0, "Starting time offset (seconds)")
 	flag.UintVar(&endTimeSec, "e", 0, "End time (seconds, leave out for full file)")
 	flag.Parse()
+
+	shouldHalt = false
+	shouldExit = false
 }
 
 func nowMillis() int64 {
@@ -95,11 +105,21 @@ type Playback struct {
 
 	firstMsgMillis    int64
 	firstMsgWallclock int64
+	haltOffsetMillis  int64
+
+	haltStartWallclock int64
 }
 
 func (p *Playback) Init(startTimeSec uint, endTimeSec uint) {
 	p.lastStartTimeSec = startTimeSec
 	p.endTimeAvailable = endTimeSec > 0
+
+	// reset to file start (needed for re-start of playback)
+	_, err := p.File.Seek(0, 0)
+	if err != nil {
+		log.Fatalln("Error selecting file start")
+	}
+	p.haltOffsetMillis = 0
 
 	// get first entry in recording file
 	msg, len := readEntry(p.File)
@@ -138,7 +158,7 @@ func (p *Playback) PlayNextMessage() bool {
 	}
 
 	// wait for target time to be reached
-	targetWallclock := p.firstMsgWallclock + (msg.Millis - p.firstMsgMillis)
+	targetWallclock := p.firstMsgWallclock + (msg.Millis - p.firstMsgMillis) + p.haltOffsetMillis
 	for {
 		if nowMillis() >= targetWallclock {
 			log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(msgMillisRelative)/1000.0, len, msg.Topic)
@@ -150,6 +170,58 @@ func (p *Playback) PlayNextMessage() bool {
 	}
 
 	return true // still messages left
+}
+
+func (p *Playback) Halt() {
+	p.haltStartWallclock = nowMillis()
+}
+
+func (p *Playback) Restart() {
+	p.haltOffsetMillis = nowMillis() - p.haltStartWallclock
+}
+
+const KEY_SIGINT string = "SIGINT"
+const KEY_UP string = "UP"
+const KEY_DOWN string = "DOWN"
+const KEY_RIGHT string = "RIGHT"
+const KEY_LEFT string = "LEFT"
+
+func readKeypress() (string, error) {
+	const ETX = '\x03' // ^C
+
+	// switch stdin into "raw" mode to get key presses without need for a newline
+	oldState, err := term.MakeRaw(0)
+	if err != nil {
+		return "", err
+	}
+	defer term.Restore(0, oldState)
+
+	// read text from terminal
+	readBuf := make([]byte, 3)
+	numRead, err := os.Stdin.Read(readBuf) // this is blocking
+	if err != nil {
+		return "", err
+	}
+
+	if readBuf[0] == ETX {
+		return KEY_SIGINT, nil
+	}
+
+	// Three-character control sequence, beginning with "ESC-[".
+	if numRead == 3 && readBuf[0] == 27 && readBuf[1] == 91 {
+		if readBuf[2] == 65 {
+			return KEY_UP, nil
+		} else if readBuf[2] == 66 {
+			return KEY_DOWN, nil
+		} else if readBuf[2] == 67 {
+			return KEY_RIGHT, nil
+		} else if readBuf[2] == 68 {
+			return KEY_LEFT, nil
+		}
+	} else if numRead == 1 {
+		return string(readBuf[0]), nil
+	}
+	return "", errors.New("unknown key sequence")
 }
 
 func main() {
@@ -188,6 +260,21 @@ func main() {
 		log.Println("Success connecting to MQTT broker")
 	}
 
+	// capture some signals
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		for sig := range c {
+			if sig == os.Interrupt {
+				if shouldHalt { // second SIGINT -> exit
+					shouldExit = true
+				} else { // first SIGINT -> just halt
+					shouldHalt = true
+				}
+			}
+		}
+	}()
+
 	//
 	// process recording file
 	//
@@ -198,7 +285,41 @@ func main() {
 	playControl.Init(startTimeSec, endTimeSec)
 
 	messagesLeft := true
-	for messagesLeft {
+	for messagesLeft && !shouldExit {
+		for shouldHalt {
+			playControl.Halt()
+
+			key, err := readKeypress() // blocking
+			if err != nil {
+				log.Fatalln("Error reading key: ", err)
+				break
+			}
+			if key == KEY_SIGINT {
+				log.Println("Exit requested")
+				os.Exit(0)
+			}
+
+			if key == KEY_RIGHT {
+				fmt.Println("TODO: implement skip")
+
+			} else if key == KEY_LEFT {
+				playControl.Init(0, endTimeSec)
+				shouldHalt = false
+				break
+
+			} else if key == " " {
+				playControl.Restart()
+				shouldHalt = false
+				break
+
+			} else {
+				fmt.Println("Unknown key, use:")
+				fmt.Println("  <space> to play again")
+				fmt.Println("  <right arrow> to skip forwards")
+				fmt.Println("  <left arrow> to start from beginning")
+			}
+		}
+
 		messagesLeft = playControl.PlayNextMessage()
 	}
 
