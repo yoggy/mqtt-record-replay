@@ -30,6 +30,8 @@ import (
 const buildVersion string = "v2.0.0-alpha"
 
 // configuration values
+const skipSeconds int = 5
+
 var verbosity int
 var brokerURL string
 var filename string
@@ -100,46 +102,79 @@ type Playback struct {
 
 	// internal playback state
 	endTimeAvailable   bool
-	lastStartTimeSec   uint
-	recordingStartTime int64
+	endTimeMillis      int64
+	recordingStartTime int64 // timestamp of first entry in file
 
 	firstMsgMillis    int64
 	firstMsgWallclock int64
+	msgMillisRelative int64 // current playback position
 	haltOffsetMillis  int64
 
 	haltStartWallclock int64
 }
 
-func (p *Playback) Init(startTimeSec uint, endTimeSec uint) {
-	p.lastStartTimeSec = startTimeSec
+func (p *Playback) Init(endTimeSec uint) {
 	p.endTimeAvailable = endTimeSec > 0
+	p.endTimeMillis = int64(endTimeSec) * 1000
+}
 
-	// reset to file start (needed for re-start of playback)
-	_, err := p.File.Seek(0, 0)
-	if err != nil {
-		log.Fatalln("Error selecting file start")
+func (p *Playback) PlayFrom(startTimeSec uint) {
+	startTimeMillis := int64(startTimeSec * 1000)
+
+	// reset to file start when skipping backwards
+	if startTimeMillis < p.msgMillisRelative {
+		_, err := p.File.Seek(0, 0)
+		if err != nil {
+			log.Fatalln("Error selecting file start")
+		}
 	}
-	p.haltOffsetMillis = 0
 
-	// get first entry in recording file
-	msg, len := readEntry(p.File)
-	p.recordingStartTime = msg.Millis // timestamp of first entry in file
+	// search for (new) start message when playback position has changed
+	if startTimeMillis != p.msgMillisRelative {
+		p.haltOffsetMillis = 0
 
-	// fast forward to message at requested start time
-	for {
-		msgMillisRelative := msg.Millis - p.recordingStartTime
-		if msgMillisRelative >= int64(startTimeSec*1000) {
-			log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(msgMillisRelative)/1000.0, len, msg.Topic)
-			publish(p.Client, msg)
+		// get first entry in recording file
+		msg, len := readEntry(p.File)
+		if len < 0 {
+			log.Println("End of recording reached")
+			return
+		}
+		p.recordingStartTime = msg.Millis // timestamp of first entry in file
 
-			p.firstMsgMillis = msg.Millis
-			p.firstMsgWallclock = nowMillis()
+		// fast forward to message at requested start time
+		for {
+			p.msgMillisRelative = msg.Millis - p.recordingStartTime
+			if p.msgMillisRelative >= int64(startTimeSec*1000) {
+				log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(p.msgMillisRelative)/1000.0, len, msg.Topic)
+				publish(p.Client, msg)
 
-			break
+				p.firstMsgMillis = msg.Millis
+				p.firstMsgWallclock = nowMillis()
+
+				break
+			}
+
+			msg, len = readEntry(p.File) // not at start time yet, skip to next message
+			if len < 0 {
+				log.Println("End of recording reached")
+				return
+			}
 		}
 
-		msg, len = readEntry(p.File) // not at start time yet, skip to next message
+	} else {
+		// just re-start playing otherwise
+		p.haltOffsetMillis = nowMillis() - p.haltStartWallclock
 	}
+}
+
+func (p *Playback) SkipAndPlay(relativePlayPositionSec int) {
+	currentPositionSec := p.msgMillisRelative / 1000
+	targetPositionSec := currentPositionSec + int64(relativePlayPositionSec)
+	if targetPositionSec < 0 {
+		targetPositionSec = 0
+	}
+
+	p.PlayFrom(uint(targetPositionSec))
 }
 
 func (p *Playback) PlayNextMessage() bool {
@@ -149,10 +184,10 @@ func (p *Playback) PlayNextMessage() bool {
 		return false
 	}
 
-	msgMillisRelative := msg.Millis - p.recordingStartTime
+	p.msgMillisRelative = msg.Millis - p.recordingStartTime
 
 	// check requested end time
-	if p.endTimeAvailable && msgMillisRelative > int64(endTimeSec*1000) {
+	if p.endTimeAvailable && p.msgMillisRelative > p.endTimeMillis {
 		log.Println("Requested end time reached")
 		return false
 	}
@@ -161,7 +196,7 @@ func (p *Playback) PlayNextMessage() bool {
 	targetWallclock := p.firstMsgWallclock + (msg.Millis - p.firstMsgMillis) + p.haltOffsetMillis
 	for {
 		if nowMillis() >= targetWallclock {
-			log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(msgMillisRelative)/1000.0, len, msg.Topic)
+			log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(p.msgMillisRelative)/1000.0, len, msg.Topic)
 			publish(p.Client, msg)
 			break
 		}
@@ -172,12 +207,8 @@ func (p *Playback) PlayNextMessage() bool {
 	return true // still messages left
 }
 
-func (p *Playback) Halt() {
+func (p *Playback) Pause() {
 	p.haltStartWallclock = nowMillis()
-}
-
-func (p *Playback) Restart() {
-	p.haltOffsetMillis = nowMillis() - p.haltStartWallclock
 }
 
 const KEY_SIGINT string = "SIGINT"
@@ -282,12 +313,13 @@ func main() {
 	playControl.File = file
 	playControl.Client = client
 
-	playControl.Init(startTimeSec, endTimeSec)
+	playControl.Init(endTimeSec)
+	playControl.PlayFrom(startTimeSec)
 
 	messagesLeft := true
 	for messagesLeft && !shouldExit {
 		for shouldHalt {
-			playControl.Halt()
+			playControl.Pause()
 
 			key, err := readKeypress() // blocking
 			if err != nil {
@@ -300,15 +332,22 @@ func main() {
 			}
 
 			if key == KEY_RIGHT {
-				fmt.Println("TODO: implement skip")
+				playControl.SkipAndPlay(skipSeconds)
+				shouldHalt = false
+				break
 
 			} else if key == KEY_LEFT {
-				playControl.Init(0, endTimeSec)
+				playControl.SkipAndPlay(-skipSeconds)
+				shouldHalt = false
+				break
+
+			} else if key == KEY_UP {
+				playControl.PlayFrom(startTimeSec)
 				shouldHalt = false
 				break
 
 			} else if key == " " {
-				playControl.Restart()
+				playControl.SkipAndPlay(0)
 				shouldHalt = false
 				break
 
@@ -316,7 +355,8 @@ func main() {
 				fmt.Println("Unknown key, use:")
 				fmt.Println("  <space> to play again")
 				fmt.Println("  <right arrow> to skip forwards")
-				fmt.Println("  <left arrow> to start from beginning")
+				fmt.Println("  <left arrow>  to skip backwards")
+				fmt.Println("  <up arrow>    to start from beginning")
 			}
 		}
 

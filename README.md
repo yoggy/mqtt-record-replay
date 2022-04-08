@@ -51,7 +51,8 @@ During playback, some playback control (play/pause and skipping) is possible by 
 - Halt the playback with SIGINT (`Ctrl-C`):
   * Press the space bar to start playing again
   * Press right arrow key to skip 5 seconds forward
-  * Restart from beginning with left arrow key
+  * Press left arrow key to skip 5 seconds backwards
+  * Press up arrow key to skip to the beginning
 - (use SIGQUIT (`Ctrl+-\`) to stop the application or use SIGINT twice)
 
 
