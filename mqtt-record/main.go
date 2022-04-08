@@ -79,7 +79,6 @@ var message_handler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Mess
 
 	file.Write(buf_size)
 	file.Write(buf_payload)
-	file.Sync()
 }
 
 func main() {
