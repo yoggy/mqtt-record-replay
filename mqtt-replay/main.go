@@ -84,6 +84,74 @@ func publish(client mqtt.Client, msg MqttMessage) {
 	token.Wait()
 }
 
+type Playback struct {
+	File   *os.File
+	Client mqtt.Client
+
+	// internal playback state
+	endTimeAvailable   bool
+	lastStartTimeSec   uint
+	recordingStartTime int64
+
+	firstMsgMillis    int64
+	firstMsgWallclock int64
+}
+
+func (p *Playback) Init(startTimeSec uint, endTimeSec uint) {
+	p.lastStartTimeSec = startTimeSec
+	p.endTimeAvailable = endTimeSec > 0
+
+	// get first entry in recording file
+	msg, len := readEntry(p.File)
+	p.recordingStartTime = msg.Millis // timestamp of first entry in file
+
+	// fast forward to message at requested start time
+	for {
+		msgMillisRelative := msg.Millis - p.recordingStartTime
+		if msgMillisRelative >= int64(startTimeSec*1000) {
+			log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(msgMillisRelative)/1000.0, len, msg.Topic)
+			publish(p.Client, msg)
+
+			p.firstMsgMillis = msg.Millis
+			p.firstMsgWallclock = nowMillis()
+
+			break
+		}
+
+		msg, len = readEntry(p.File) // not at start time yet, skip to next message
+	}
+}
+
+func (p *Playback) PlayNextMessage() bool {
+	msg, len := readEntry(p.File)
+	if len < 0 {
+		log.Println("End of recording reached")
+		return false
+	}
+
+	msgMillisRelative := msg.Millis - p.recordingStartTime
+
+	// check requested end time
+	if p.endTimeAvailable && msgMillisRelative > int64(endTimeSec*1000) {
+		log.Println("Requested end time reached")
+		return false
+	}
+
+	// wait for target time to be reached
+	targetWallclock := p.firstMsgWallclock + (msg.Millis - p.firstMsgMillis)
+	for {
+		if nowMillis() >= targetWallclock {
+			log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(msgMillisRelative)/1000.0, len, msg.Topic)
+			publish(p.Client, msg)
+			break
+		}
+
+		time.Sleep(200 * time.Microsecond)
+	}
+
+	return true // still messages left
+}
+
 func main() {
 	fmt.Println("MQTT Recording Replay " + buildVersion)
 	fmt.Println("- MQTT broker:     ", brokerURL)
@@ -123,55 +191,15 @@ func main() {
 	//
 	// process recording file
 	//
-	endTimeAvailable := endTimeSec > 0
+	var playControl Playback
+	playControl.File = file
+	playControl.Client = client
 
-	// get first entry in recording file
-	msg, len := readEntry(file)
-	recordingStartTime := msg.Millis // timestamp of first entry in file
+	playControl.Init(startTimeSec, endTimeSec)
 
-	var firstMsgMilis int64
-	var firstMsgWallclock int64
-
-	// fast forward to message at requested start time
-	for {
-		if msg.Millis-recordingStartTime >= int64(startTimeSec*1000) {
-			log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(msg.Millis-recordingStartTime)/1000.0, len, msg.Topic)
-			publish(client, msg)
-
-			firstMsgMilis = msg.Millis
-			firstMsgWallclock = nowMillis()
-
-			break
-		}
-
-		msg, len = readEntry(file) // skip to next message
-	}
-
-	// play messages until requested end time
-	for {
-		msg, len = readEntry(file)
-		if len < 0 {
-			log.Println("End of recording reached")
-			break
-		}
-
-		// check requested end time
-		if endTimeAvailable && msg.Millis-recordingStartTime > int64(endTimeSec*1000) {
-			log.Println("Requested end time reached")
-			break
-		}
-
-		// wait for target time to be reached
-		targetWallclock := firstMsgWallclock + (msg.Millis - firstMsgMilis)
-		for {
-			if nowMillis() >= targetWallclock {
-				log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(msg.Millis-recordingStartTime)/1000.0, len, msg.Topic)
-				publish(client, msg)
-				break
-			}
-
-			time.Sleep(200 * time.Microsecond)
-		}
+	messagesLeft := true
+	for messagesLeft {
+		messagesLeft = playControl.PlayNextMessage()
 	}
 
 	log.Println("Replay finished")
