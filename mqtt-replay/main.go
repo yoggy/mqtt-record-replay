@@ -46,10 +46,17 @@ func init() {
 	flag.IntVar(&verbosity, "v", 1, "verbosity level: off (0), info (1), debug (2)")
 
 	flag.StringVar(&brokerURL, "b", "tcp://localhost:1883", "MQTT broker URL")
-	flag.StringVar(&filename, "i", "", "Input file")
+	flag.StringVar(&filename, "i", "", "Input file (REQUIRED)")
 	flag.UintVar(&startTimeSec, "s", 0, "Starting time offset (seconds)")
 	flag.UintVar(&endTimeSec, "e", 0, "End time (seconds, leave out for full file)")
 	flag.Parse()
+
+	if filename == "" {
+		println("ERROR: Input file name not set!")
+		println("Usage:")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
 
 	shouldHalt = false
 	shouldExit = false
