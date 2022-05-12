@@ -17,6 +17,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -38,13 +39,11 @@ var filename string
 const msgStatsTime int = 5 // report statistics every 5 seconds
 
 func init() {
-	autoFileName := "recording-" + time.Now().Format("2006-01-02T150405") + ".mqtt"
-
 	flag.IntVar(&verbosity, "v", 1, "verbosity level: off (0), info (1), debug (2)")
 
 	flag.StringVar(&brokerURL, "b", "tcp://localhost:1883", "MQTT broker URL")
 	flag.StringVar(&topic, "t", "#", "MQTT topic to subscribe")
-	flag.StringVar(&filename, "o", autoFileName, "Output file name")
+	flag.StringVar(&filename, "o", "recording-$topic-$time.mqtt", "Output file name")
 	flag.Parse()
 }
 
@@ -82,6 +81,12 @@ var message_handler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Mess
 }
 
 func main() {
+	var filenameSafeTopic = strings.ReplaceAll(topic, "/", "_")
+	var filenameTimestamp = time.Now().Format("2006-01-02T150405")
+
+	filename = strings.Replace(filename, "$topic", filenameSafeTopic, 1)
+	filename = strings.Replace(filename, "$time", filenameTimestamp, 1)
+
 	fmt.Println("MQTT Recorder " + buildVersion)
 	fmt.Println("- MQTT broker:     ", brokerURL)
 	fmt.Println("- Subscribe topic: ", topic)
