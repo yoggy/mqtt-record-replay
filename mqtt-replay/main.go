@@ -137,7 +137,7 @@ func (p *Playback) PlayFrom(startTimeSec uint) {
 	}
 
 	// search for (new) start message when playback position has changed
-	if startTimeMillis != p.msgMillisRelative {
+	if startTimeMillis == 0 || startTimeMillis != p.msgMillisRelative {
 		p.haltOffsetMillis = 0
 
 		// get first entry in recording file
