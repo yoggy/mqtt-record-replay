@@ -24,7 +24,7 @@ import (
 	msgpack "github.com/vmihailenco/msgpack/v5"
 )
 
-const buildVersion string = "v2.0.0-alpha"
+const buildVersion string = "v2.0.0"
 
 // global variables
 var file *os.File

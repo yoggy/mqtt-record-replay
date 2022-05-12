@@ -27,7 +27,7 @@ import (
 	"golang.org/x/term"
 )
 
-const buildVersion string = "v2.0.0-alpha"
+const buildVersion string = "v2.0.0"
 
 // configuration values
 const skipSeconds int = 5
