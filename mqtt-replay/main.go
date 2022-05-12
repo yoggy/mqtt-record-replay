@@ -125,11 +125,9 @@ func (p *Playback) Init(endTimeSec uint) {
 	p.endTimeMillis = int64(endTimeSec) * 1000
 }
 
-func (p *Playback) PlayFrom(startTimeSec uint) {
-	startTimeMillis := int64(startTimeSec * 1000)
-
+func (p *Playback) PlayFrom(startTimeMillis uint) {
 	// reset to file start when skipping backwards
-	if startTimeMillis < p.msgMillisRelative {
+	if int64(startTimeMillis) < p.msgMillisRelative {
 		_, err := p.File.Seek(0, 0)
 		if err != nil {
 			log.Fatalln("Error selecting file start")
@@ -137,7 +135,7 @@ func (p *Playback) PlayFrom(startTimeSec uint) {
 	}
 
 	// search for (new) start message when playback position has changed
-	if startTimeMillis == 0 || startTimeMillis != p.msgMillisRelative {
+	if startTimeMillis == 0 || int64(startTimeMillis) != p.msgMillisRelative {
 		p.haltOffsetMillis = 0
 
 		// get first entry in recording file
@@ -146,12 +144,14 @@ func (p *Playback) PlayFrom(startTimeSec uint) {
 			log.Println("End of recording reached")
 			return
 		}
-		p.recordingStartTime = msg.Millis // timestamp of first entry in file
+		if p.recordingStartTime == 0 { // only set for very first call
+			p.recordingStartTime = msg.Millis // timestamp of first entry in file
+		}
 
 		// fast forward to message at requested start time
 		for {
 			p.msgMillisRelative = msg.Millis - p.recordingStartTime
-			if p.msgMillisRelative >= int64(startTimeSec*1000) {
+			if p.msgMillisRelative >= int64(startTimeMillis) {
 				log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(p.msgMillisRelative)/1000.0, len, msg.Topic)
 				publish(p.Client, msg)
 
@@ -175,13 +175,13 @@ func (p *Playback) PlayFrom(startTimeSec uint) {
 }
 
 func (p *Playback) SkipAndPlay(relativePlayPositionSec int) {
-	currentPositionSec := p.msgMillisRelative / 1000
-	targetPositionSec := currentPositionSec + int64(relativePlayPositionSec)
-	if targetPositionSec < 0 {
-		targetPositionSec = 0
+	currentPositionMillis := p.msgMillisRelative
+	targetPositionMillis := currentPositionMillis + int64(relativePlayPositionSec*1000)
+	if targetPositionMillis < 0 {
+		targetPositionMillis = 0
 	}
 
-	p.PlayFrom(uint(targetPositionSec))
+	p.PlayFrom(uint(targetPositionMillis * 1000))
 }
 
 func (p *Playback) PlayNextMessage() bool {
@@ -321,7 +321,7 @@ func main() {
 	playControl.Client = client
 
 	playControl.Init(endTimeSec)
-	playControl.PlayFrom(startTimeSec)
+	playControl.PlayFrom(startTimeSec * 1000)
 
 	messagesLeft := true
 	for messagesLeft && !shouldExit {
@@ -349,7 +349,7 @@ func main() {
 				break
 
 			} else if key == KEY_UP {
-				playControl.PlayFrom(startTimeSec)
+				playControl.PlayFrom(startTimeSec * 1000)
 				shouldHalt = false
 				break
 

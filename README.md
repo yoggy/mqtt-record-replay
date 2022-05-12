@@ -27,6 +27,7 @@ Record any MQTT topics from an MQTT broker to an arbitrary file name.
 
 - The connection to the broker needs to be given as a URL (tcp, ws and ssl "schemes" are supported).
 - The topic can be any valid MQTT topic string, including MQTT wildcards
+- The output file name will be generated with topic name and timestamp, if not explicitly set
 
 ```shell
 mqtt-record -b tcp://iot.eclipse.org:1883 -t "test/record/topic/#" -o record.mqtt
@@ -58,8 +59,8 @@ During playback, some playback control (play/pause and skipping) is possible by 
 
 
 ## Copyright and license
-Copyright (c) 2018 yoggy
-Copyright (c) 2021 Bendix Buchheister
+Copyright (c) 2018 yoggy  
+Copyright (c) 2021 Bendix Buchheister  
 Copyright (c) 2022 Jannik Beyerstedt
 
 Released under the [MIT license](LICENSE.txt)
