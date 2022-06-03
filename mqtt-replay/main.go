@@ -181,7 +181,7 @@ func (p *Playback) SkipAndPlay(relativePlayPositionSec int) {
 		targetPositionMillis = 0
 	}
 
-	p.PlayFrom(uint(targetPositionMillis * 1000))
+	p.PlayFrom(uint(targetPositionMillis))
 }
 
 func (p *Playback) PlayNextMessage() bool {
