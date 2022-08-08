@@ -27,7 +27,7 @@ import (
 	"golang.org/x/term"
 )
 
-const buildVersion string = "v2.0.0"
+const buildVersion string = "v2.1.0"
 
 // configuration values
 const skipSeconds int = 5
@@ -37,6 +37,7 @@ var brokerURL string
 var filename string
 var startTimeSec uint
 var endTimeSec uint // end time of 0 seconds doesn't make sense, so use it for "full file"
+var versionMode bool
 
 // internal state
 var shouldHalt bool
@@ -49,9 +50,10 @@ func init() {
 	flag.StringVar(&filename, "i", "", "Input file (REQUIRED)")
 	flag.UintVar(&startTimeSec, "s", 0, "Starting time offset (seconds)")
 	flag.UintVar(&endTimeSec, "e", 0, "End time (seconds, leave out for full file)")
+	flag.BoolVar(&versionMode, "version", false, "Print version number")
 	flag.Parse()
 
-	if filename == "" {
+	if filename == "" && !versionMode {
 		println("ERROR: Input file name not set!")
 		println("Usage:")
 		flag.PrintDefaults()
@@ -263,7 +265,10 @@ func readKeypress() (string, error) {
 }
 
 func main() {
-	fmt.Println("MQTT Recording Replay " + buildVersion)
+	fmt.Println("MQTT Recording Player " + buildVersion)
+	if versionMode {
+		os.Exit(0)
+	}
 	fmt.Println("- MQTT broker:     ", brokerURL)
 	fmt.Println("- Input filename:  ", filename)
 	if endTimeSec > 0 {

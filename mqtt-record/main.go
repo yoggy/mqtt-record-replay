@@ -26,7 +26,7 @@ import (
 	msgpack "github.com/vmihailenco/msgpack/v5"
 )
 
-const buildVersion string = "v2.0.0"
+const buildVersion string = "v2.1.0"
 
 // global variables
 var file *os.File
@@ -38,6 +38,7 @@ var brokerURL string
 var topic string
 var filename string
 var statsOutput bool
+var versionMode bool
 
 const msgStatsTime int = 5 // report statistics every 5 seconds
 
@@ -83,6 +84,7 @@ func init() {
 	flag.StringVar(&topic, "t", "#", "MQTT topic to subscribe")
 	flag.StringVar(&filename, "o", "recording-$topic-$time.mqtt", "Output file name")
 	flag.BoolVar(&statsOutput, "s", false, "Print regular message statistics per topic")
+	flag.BoolVar(&versionMode, "version", false, "Print version number")
 	flag.Parse()
 }
 
@@ -152,6 +154,9 @@ func main() {
 	filename = strings.Replace(filename, "$time", filenameTimestamp, 1)
 
 	fmt.Println("MQTT Recorder " + buildVersion)
+	if versionMode {
+		os.Exit(0)
+	}
 	fmt.Println("- MQTT broker:     ", brokerURL)
 	fmt.Println("- Subscribe topic: ", topic)
 	fmt.Println("- Output filename: ", filename)
