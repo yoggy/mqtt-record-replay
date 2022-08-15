@@ -1,33 +1,11 @@
 //
 // mqtt-replay.go - tools for recording from and playing back to MQTT topics.
 //
-// How to:
-//   $ mkdir -p ~/work/
-//   $ cd ~/work/
-//   $ git clone https://github.com/yoggy/mqtt-record-replay.git
-//   $ cd mqtt-record-replay
-//   $ go get -u github.com/eclipse/paho.mqtt.golang
-//   $ go get -u github.com/vmihailenco/msgpack
-//   $ go build mqtt-record.go
-//   $ go build mqtt-replay.go
-//
-//   $ ./mqtt-record
-//   usage: mqtt-record.exe url subscribe_topic record_filename
-//
-//   example:
-//
-//       $ mqtt-record.exe tcp://iot.exlipse.org:1883 "test/record/topic/#" record.mqtt
-//
-//
-//   $ ./mqtt-replay
-//   usage: mqtt-replay.exe recording_filename url
-//
-//    example:
-//
-//        $ mqtt-replay.exe recording.mqtt tcp://iot.eclipse.org:1883
 //
 // License:
 //   Copyright (c) 2018 yoggy <yoggy0@gmail.com>
+//   Copyright (c) 2021 Bendix Buchheister <buchheister@consider-it.de>
+//   Copyright (c) 2022 Jannik Beyerstedt <beyerstedt@consider-it.de>
 //   Released under the MIT license
 //   http://opensource.org/licenses/mit-license.php;
 //
@@ -35,27 +13,58 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
+	"flag"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"os"
-	"strconv"
+	"os/signal"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
-	msgpack "github.com/vmihailenco/msgpack"
+	msgpack "github.com/vmihailenco/msgpack/v5"
+	"golang.org/x/term"
 )
 
-func usage(msg string) {
-	fmt.Printf("%s\n", msg)
-	fmt.Printf("usage: %s recording_filename url [start_time] [stop_time]\n", os.Args[0])
-	fmt.Printf("start & stop time in seconds\n")
-	fmt.Printf("example:\n")
-	fmt.Printf("\n")
-	fmt.Printf("    $ %s recording.mqtt tcp://iot.exlipse.org:1883\n", os.Args[0])
-	fmt.Printf("\n")
-	os.Exit(0)
+const buildVersion string = "v2.1.0"
+
+// configuration values
+const skipSeconds int = 5
+
+var verbosity int
+var brokerURL string
+var filename string
+var startTimeSec uint
+var endTimeSec uint // end time of 0 seconds doesn't make sense, so use it for "full file"
+var versionMode bool
+
+// internal state
+var shouldHalt bool
+var shouldExit bool
+
+func init() {
+	flag.IntVar(&verbosity, "v", 1, "verbosity level: off (0), info (1), debug (2)")
+
+	flag.StringVar(&brokerURL, "b", "tcp://localhost:1883", "MQTT broker URL")
+	flag.StringVar(&filename, "i", "", "Input file (REQUIRED)")
+	flag.UintVar(&startTimeSec, "s", 0, "Starting time offset (seconds)")
+	flag.UintVar(&endTimeSec, "e", 0, "End time (seconds, leave out for full file)")
+	flag.BoolVar(&versionMode, "version", false, "Print version number")
+	flag.Parse()
+
+	if filename == "" && !versionMode {
+		println("ERROR: Input file name not set!")
+		println("Usage:")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	shouldHalt = false
+	shouldExit = false
 }
 
-func millis() int64 {
+func nowMillis() int64 {
 	return time.Now().UnixNano() / int64(time.Millisecond)
 }
 
@@ -65,139 +74,306 @@ type MqttMessage struct {
 	Payload []byte
 }
 
-func readPayloadSize(f *os.File) int64 {
+func readEntry(file *os.File) (MqttMessage, int64) {
+	// read payload size entry
 	buf := make([]byte, binary.MaxVarintLen64)
-	_, err := f.Read(buf)
+	_, err := file.Read(buf)
 	if err != nil {
-		return -1
+		return MqttMessage{}, -1 // EOF reached
 	}
 	payload_size, _ := binary.Varint(buf)
-	return payload_size
+
+	// read payload buffer
+	payload_buf := make([]byte, payload_size)
+	_, err = file.Read(payload_buf)
+	if err != nil {
+		return MqttMessage{}, -1 // EOF reached
+	}
+
+	// unpack message
+	var msg MqttMessage
+	err = msgpack.Unmarshal(payload_buf, &msg)
+	if err != nil {
+		log.Fatalln("Fatal error unpacking packet in recording file")
+	}
+
+	return msg, payload_size
 }
 
-func readPayload(f *os.File, size int64) []byte {
-	buf := make([]byte, size)
-	_, err := f.Read(buf)
-	if err != nil {
-		return nil
-	}
-	return buf
+func publish(client mqtt.Client, msg MqttMessage) {
+	token := client.Publish(msg.Topic, byte(0), false, msg.Payload)
+	token.Wait()
 }
 
-func mqtt_replay(filename, url string, start int64, stop int64) {
-	f, err := os.Open(filename)
-	if err != nil {
-		usage(string("Couldn't open File"))
-		panic(err)
-	}
-	defer f.Close()
+type Playback struct {
+	File   *os.File
+	Client mqtt.Client
 
+	// internal playback state
+	endTimeAvailable   bool
+	endTimeMillis      int64
+	recordingStartTime int64 // timestamp of first entry in file
+
+	firstMsgMillis    int64
+	firstMsgWallclock int64
+	msgMillisRelative int64 // current playback position
+	haltOffsetMillis  int64
+
+	haltStartWallclock int64
+}
+
+func (p *Playback) Init(endTimeSec uint) {
+	p.endTimeAvailable = endTimeSec > 0
+	p.endTimeMillis = int64(endTimeSec) * 1000
+}
+
+func (p *Playback) PlayFrom(startTimeMillis uint) {
+	// reset to file start when skipping backwards
+	if int64(startTimeMillis) < p.msgMillisRelative {
+		_, err := p.File.Seek(0, 0)
+		if err != nil {
+			log.Fatalln("Error selecting file start")
+		}
+	}
+
+	// search for (new) start message when playback position has changed
+	if startTimeMillis == 0 || int64(startTimeMillis) != p.msgMillisRelative {
+		p.haltOffsetMillis = 0
+
+		// get first entry in recording file
+		msg, len := readEntry(p.File)
+		if len < 0 {
+			log.Println("End of recording reached")
+			return
+		}
+		if p.recordingStartTime == 0 { // only set for very first call
+			p.recordingStartTime = msg.Millis // timestamp of first entry in file
+		}
+
+		// fast forward to message at requested start time
+		for {
+			p.msgMillisRelative = msg.Millis - p.recordingStartTime
+			if p.msgMillisRelative >= int64(startTimeMillis) {
+				log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(p.msgMillisRelative)/1000.0, len, msg.Topic)
+				publish(p.Client, msg)
+
+				p.firstMsgMillis = msg.Millis
+				p.firstMsgWallclock = nowMillis()
+
+				break
+			}
+
+			msg, len = readEntry(p.File) // not at start time yet, skip to next message
+			if len < 0 {
+				log.Println("End of recording reached")
+				return
+			}
+		}
+
+	} else {
+		// just re-start playing otherwise
+		p.haltOffsetMillis = nowMillis() - p.haltStartWallclock
+	}
+}
+
+func (p *Playback) SkipAndPlay(relativePlayPositionSec int) {
+	currentPositionMillis := p.msgMillisRelative
+	targetPositionMillis := currentPositionMillis + int64(relativePlayPositionSec*1000)
+	if targetPositionMillis < 0 {
+		targetPositionMillis = 0
+	}
+
+	p.PlayFrom(uint(targetPositionMillis))
+}
+
+func (p *Playback) PlayNextMessage() bool {
+	msg, len := readEntry(p.File)
+	if len < 0 {
+		log.Println("End of recording reached")
+		return false
+	}
+
+	p.msgMillisRelative = msg.Millis - p.recordingStartTime
+
+	// check requested end time
+	if p.endTimeAvailable && p.msgMillisRelative > p.endTimeMillis {
+		log.Println("Requested end time reached")
+		return false
+	}
+
+	// wait for target time to be reached
+	targetWallclock := p.firstMsgWallclock + (msg.Millis - p.firstMsgMillis) + p.haltOffsetMillis
+	for {
+		if nowMillis() >= targetWallclock {
+			log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(p.msgMillisRelative)/1000.0, len, msg.Topic)
+			publish(p.Client, msg)
+			break
+		}
+
+		time.Sleep(200 * time.Microsecond)
+	}
+
+	return true // still messages left
+}
+
+func (p *Playback) Pause() {
+	p.haltStartWallclock = nowMillis()
+}
+
+const KEY_SIGINT string = "SIGINT"
+const KEY_UP string = "UP"
+const KEY_DOWN string = "DOWN"
+const KEY_RIGHT string = "RIGHT"
+const KEY_LEFT string = "LEFT"
+
+func readKeypress() (string, error) {
+	const ETX = '\x03' // ^C
+
+	// switch stdin into "raw" mode to get key presses without need for a newline
+	oldState, err := term.MakeRaw(0)
+	if err != nil {
+		return "", err
+	}
+	defer term.Restore(0, oldState)
+
+	// read text from terminal
+	readBuf := make([]byte, 3)
+	numRead, err := os.Stdin.Read(readBuf) // this is blocking
+	if err != nil {
+		return "", err
+	}
+
+	if readBuf[0] == ETX {
+		return KEY_SIGINT, nil
+	}
+
+	// Three-character control sequence, beginning with "ESC-[".
+	if numRead == 3 && readBuf[0] == 27 && readBuf[1] == 91 {
+		if readBuf[2] == 65 {
+			return KEY_UP, nil
+		} else if readBuf[2] == 66 {
+			return KEY_DOWN, nil
+		} else if readBuf[2] == 67 {
+			return KEY_RIGHT, nil
+		} else if readBuf[2] == 68 {
+			return KEY_LEFT, nil
+		}
+	} else if numRead == 1 {
+		return string(readBuf[0]), nil
+	}
+	return "", errors.New("unknown key sequence")
+}
+
+func main() {
+	fmt.Println("MQTT Recording Player " + buildVersion)
+	if versionMode {
+		os.Exit(0)
+	}
+	fmt.Println("- MQTT broker:     ", brokerURL)
+	fmt.Println("- Input filename:  ", filename)
+	if endTimeSec > 0 {
+		fmt.Println("- Interval:        ", startTimeSec, "-", endTimeSec, "sec.")
+	} else if startTimeSec > 0 {
+		fmt.Println("- Start time:      ", startTimeSec, "sec.")
+	}
+	fmt.Println("")
+
+	if verbosity < 1 {
+		log.SetFlags(0)
+		log.SetOutput(ioutil.Discard)
+	}
+
+	// try opening file for reading
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalln("Error opening file for reading:", err)
+	}
+	defer file.Close()
+
+	// try connecting to MQTT broker
 	opts := mqtt.NewClientOptions()
-	opts.AddBroker(url)
+	opts.AddBroker(brokerURL)
 
 	client := mqtt.NewClient(opts)
 	defer client.Disconnect(100)
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		usage(string("Couldn't connect to Mqtt Broker"))
-		panic(token.Error())
+		log.Panicln("Error connecting to MQTT broker:", token.Error())
+	}
+	if verbosity > 1 {
+		log.Println("Success connecting to MQTT broker")
 	}
 
-	fmt.Printf("mqtt_replay() : start replay...file=%s, url=%s\n", filename, url)
-
-	firstMsg := true
-	startTime := millis()
-	t0 := int64(0)
-	t1 := start
-
-	for {
-		payload_size := readPayloadSize(f)
-		if payload_size == -1 {
-			break
-		}
-
-		payload_buf := readPayload(f, payload_size)
-		if payload_buf == nil {
-			break
-		}
-
-		var msg MqttMessage
-		err = msgpack.Unmarshal(payload_buf, &msg)
-		if err != nil {
-			usage(string("Couldn't unpack Message"))
-			panic(err)
-		}
-
-		if firstMsg {
-			firstMsg = false
-			hadStop := stop > 0
-			stop = stop - start
-			if hadStop && (stop < 0) {
-				stop = 0
-			}
-			start += msg.Millis
-		}
-
-		if msg.Millis >= start {
-
-			if (stop >= 0) && ((millis() - startTime) > (stop)) {
-				break
-			}
-
-			if t0 > 0 {
-				// spin lock
-				for {
-					if (millis() - t0) >= (msg.Millis - t1) {
-						break
-					}
-					time.Sleep(200 * time.Microsecond)
+	// capture some signals
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		for sig := range c {
+			if sig == os.Interrupt {
+				if shouldHalt { // second SIGINT -> exit
+					shouldExit = true
+				} else { // first SIGINT -> just halt
+					shouldHalt = true
 				}
 			}
-			fmt.Printf("mqtt_replay() : t=%d topic=%s, payload_size=%d\n", msg.Millis, msg.Topic, payload_size)
-			t0 = millis()
-			t1 = msg.Millis
-
-			token := client.Publish(msg.Topic, byte(0), false, msg.Payload)
-			token.Wait()
 		}
-	}
+	}()
 
-	fmt.Println("mqtt_record() : finish...")
-}
+	//
+	// process recording file
+	//
+	var playControl Playback
+	playControl.File = file
+	playControl.Client = client
 
-func main() {
-	if len(os.Args) < 3 {
-		usage(string("To few Arguments"))
-	}
-	if len(os.Args) > 5 {
-		usage("To many Arguments")
-	}
+	playControl.Init(endTimeSec)
+	playControl.PlayFrom(startTimeSec * 1000)
 
-	start := int64(0)
-	stop := int64(-1)
+	messagesLeft := true
+	for messagesLeft && !shouldExit {
+		for shouldHalt {
+			playControl.Pause()
 
-	if len(os.Args) >= 4 {
-		tmp, err := strconv.ParseInt(os.Args[3], 0, 64)
-		if err != nil {
-			usage(string("Start Time has to be an integer"))
-			panic(err)
+			key, err := readKeypress() // blocking
+			if err != nil {
+				log.Fatalln("Error reading key: ", err)
+				break
+			}
+			if key == KEY_SIGINT {
+				log.Println("Exit requested")
+				os.Exit(0)
+			}
+
+			if key == KEY_RIGHT {
+				playControl.SkipAndPlay(skipSeconds)
+				shouldHalt = false
+				break
+
+			} else if key == KEY_LEFT {
+				playControl.SkipAndPlay(-skipSeconds)
+				shouldHalt = false
+				break
+
+			} else if key == KEY_UP {
+				playControl.PlayFrom(startTimeSec * 1000)
+				shouldHalt = false
+				break
+
+			} else if key == " " {
+				playControl.SkipAndPlay(0)
+				shouldHalt = false
+				break
+
+			} else {
+				fmt.Println("Unknown key, use:")
+				fmt.Println("  <space> to play again")
+				fmt.Println("  <right arrow> to skip forwards")
+				fmt.Println("  <left arrow>  to skip backwards")
+				fmt.Println("  <up arrow>    to start from beginning")
+			}
 		}
-		start = tmp * 1000
-		if start < 0 {
-			start = 0
-		}
+
+		messagesLeft = playControl.PlayNextMessage()
 	}
-	if len(os.Args) >= 5 {
-		tmp, err := strconv.ParseInt(os.Args[4], 0, 64)
-		if err != nil {
-			usage(string("Stop Time has to be an integer"))
-			panic(err)
-		}
-		stop = tmp * 1000
-	}
-	if stop >= 0 {
-		fmt.Printf("%dms - %dms\n", start, stop)
-	} else {
-		fmt.Printf("%d - End\n", start)
-	}
-	mqtt_replay(os.Args[1], os.Args[2], start, stop)
+
+	log.Println("Replay finished")
 }

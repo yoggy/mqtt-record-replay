@@ -1,0 +1,91 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "*"
+  pull_request:
+    branches: ["v2"]
+
+jobs:
+  configure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: 1.18
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: linux-x86_x64
+            os: linux
+            arch: amd64
+            ext: ""
+          - name: linux-arm64
+            os: linux
+            arch: arm64
+            ext: ""
+          - name: linux-arm32
+            os: linux
+            arch: arm
+            ext: ""
+          - name: windows-amd64
+            os: windows
+            arch: amd64
+            ext: .exe
+          - name: macos-amd64
+            os: darwin
+            arch: amd64
+            ext: ""
+          - name: macos-arm64
+            os: darwin
+            arch: arm64
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Get Git Version String
+        working-directory: ${{github.workspace}}
+        run: |
+          if ${{ startsWith(github.ref, 'refs/tags/') }}; then
+            echo "app_version=${{ github.ref_name }}" >> $GITHUB_ENV
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "app_version=$(echo "${{ github.head_ref }}" | sed -r 's/\//_/g')-$(git rev-parse --short "${{ github.event.pull_request.head.sha }}")" >> $GITHUB_ENV
+          else
+            echo "app_version=$(git rev-parse --abbrev-ref HEAD | sed -r 's/\//_/g')-$(git describe --always)" >> $GITHUB_ENV
+          fi
+      - name: Print Git Version String
+        run: |
+          echo ${{ env.app_version }}
+
+      - name: Create build directory
+        run: mkdir ${{ matrix.name }}
+      - name: Build
+        run: GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -v -o ${{ matrix.name }} ./...
+
+      # output has .exe on windows and no file extension on all other targets
+      - name: Create release archive
+        run: tar -C ${{ matrix.name }} -czf mqtt-record-replay-${{ env.app_version }}-${{ matrix.name }}.tar.gz mqtt-record${{ matrix.ext }} mqtt-replay${{ matrix.ext }}
+
+      - uses: actions/upload-artifact@v2
+        with:
+          name: mqtt-record-replay-${{ env.app_version }}-${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}/mqtt-record${{ matrix.ext }}
+            ${{ matrix.name }}/mqtt-replay${{ matrix.ext }}
+
+      - name: Upload binaries to release
+        uses: svenstaro/upload-release-action@v2
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: mqtt-record-replay-${{ env.app_version }}-${{ matrix.name }}.tar.gz
+          tag: ${{ github.ref }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          overwrite: true
